@@ -10,11 +10,58 @@ ESCAPE = 0x7d
 ESCAPE_7E = 0x02
 ESCAPE_7D = 0x01
 
-# Common Message IDs (not all, just important ones)
+# Common Message IDs
 MSG_TERMINAL_REGISTER = 0x0100
 MSG_TERMINAL_AUTH = 0x0102
 MSG_HEARTBEAT = 0x0002
-MSG_LOCATION_REPORT = 0x0200  # main one we parse here
+MSG_LOCATION_REPORT = 0x0200
+MSG_PLATFORM_RESPONSE = 0x8001
+
+# Alarm bit definitions (JT/T 808-2019, Table 4)
+ALARM_BITS = {
+    0: "Emergency alarm",
+    1: "Speeding alarm",
+    2: "Fatigue driving alarm",
+    3: "Dangerous driving alarm",
+    4: "GNSS module failure",
+    5: "GNSS antenna disconnected",
+    6: "GNSS antenna short circuit",
+    7: "Low terminal battery",
+    8: "Terminal main power off",
+    9: "LCD or display failure",
+    10: "TTS module failure",
+    11: "Camera failure",
+    18: "Day driving overtime alarm",
+    19: "Overtime parking alarm",
+    20: "In-and-out area alarm",
+    21: "In-and-out route alarm",
+    22: "Route driving time insufficient/excess alarm",
+    23: "Route deviation alarm",
+    28: "VSS failure",
+    29: "Oil level anomaly alarm",
+    30: "Stolen vehicle alarm",
+    31: "Illegal ignition alarm",
+}
+
+# Status bit definitions (JT/T 808-2019, Table 5)
+# Only bits with standard definitions are listed; undefined bit positions are intentionally omitted.
+STATUS_BITS = {
+    0: "ACC on",
+    1: "Positioned",
+    2: "Latitude S (south) when set, N (north) when clear",
+    3: "Longitude W (west) when set, E (east) when clear",
+    4: "Operational",
+    5: "Encrypted",
+    10: "Open door",
+    11: "Middle door open",
+    12: "Back door open",
+    13: "Driver door open",
+    14: "Custom door open",
+    18: "Using GPS",
+    19: "Using BeiDou",
+    20: "Using GLONASS",
+    21: "Using Galileo",
+}
 
 
 # ==========================
@@ -48,11 +95,37 @@ class JT808Location:
 
 
 @dataclass
+class JT808Register:
+    province_id: int
+    city_id: int
+    manufacturer_id: str   # 5 bytes (ASCII)
+    terminal_model: str    # 20 bytes (ASCII, null-padded)
+    terminal_id: str       # 7 bytes (ASCII, null-padded)
+    license_plate_color: int
+    license_plate: str     # GBK string
+
+
+@dataclass
+class JT808Auth:
+    auth_code: str         # variable-length ASCII string
+
+
+@dataclass
+class JT808PlatformResponse:
+    response_flow_id: int  # flow ID of the terminal message being acknowledged
+    response_msg_id: int   # message ID of the terminal message being acknowledged
+    result: int            # 0=success, 1=failure, 2=wrong message, 3=unsupported
+
+
+@dataclass
 class JT808Packet:
     header: JT808Header
     body_raw: bytes
     msg_id: int
     location: Optional[JT808Location] = None
+    register: Optional[JT808Register] = None
+    auth: Optional[JT808Auth] = None
+    platform_response: Optional[JT808PlatformResponse] = None
 
 
 # ==========================
@@ -64,9 +137,7 @@ def hexstr_to_bytes(s: str) -> bytes:
     Convert a hex string like '7e 02 00 00' to bytes.
     Spaces and newlines are ignored.
     """
-    s = s.replace(" ", "").replace("
-", "").replace("
-", "")
+    s = s.replace(" ", "").replace("\n", "").replace("\r", "")
     return bytes.fromhex(s)
 
 
@@ -144,6 +215,28 @@ def bcd_to_str(b: bytes) -> str:
         result.append(str(high))
         result.append(str(low))
     return "".join(result)
+
+
+def decode_alarm_bits(alarm: int) -> List[str]:
+    """
+    Decode the alarm DWORD from a 0x0200 location report into a list of active alarm descriptions.
+    """
+    active = []
+    for bit, name in ALARM_BITS.items():
+        if (alarm >> bit) & 1:
+            active.append(name)
+    return active
+
+
+def decode_status_bits(status: int) -> List[str]:
+    """
+    Decode the status DWORD from a 0x0200 location report into a list of active status descriptions.
+    """
+    active = []
+    for bit, name in STATUS_BITS.items():
+        if (status >> bit) & 1:
+            active.append(name)
+    return active
 
 
 # ==========================
@@ -309,6 +402,83 @@ def parse_0200_location(body: bytes) -> JT808Location:
 
 
 # ==========================
+# 0x0100 Terminal Register Body Parsing
+# ==========================
+
+def parse_0100_register(body: bytes) -> JT808Register:
+    """
+    Parse the 0x0100 (Terminal Registration) message body.
+    Layout:
+      0-1   province_id (WORD)
+      2-3   city_id (WORD)
+      4-8   manufacturer_id (5 bytes, ASCII)
+      9-28  terminal_model (20 bytes, ASCII, null-padded)
+      29-35 terminal_id (7 bytes, ASCII, null-padded)
+      36    license_plate_color (BYTE): 0=no plate, 1=blue, 2=yellow, 3=black, 4=white
+      37+   license_plate (GBK string, variable length)
+    """
+    if len(body) < 37:
+        raise ValueError("0x0100 body too short")
+
+    province_id = int.from_bytes(body[0:2], "big")
+    city_id = int.from_bytes(body[2:4], "big")
+    manufacturer_id = body[4:9].decode("ascii", errors="replace").rstrip("\x00")
+    terminal_model = body[9:29].decode("ascii", errors="replace").rstrip("\x00")
+    terminal_id = body[29:36].decode("ascii", errors="replace").rstrip("\x00")
+    license_plate_color = body[36]
+    license_plate = body[37:].decode("gbk", errors="replace")
+
+    return JT808Register(
+        province_id=province_id,
+        city_id=city_id,
+        manufacturer_id=manufacturer_id,
+        terminal_model=terminal_model,
+        terminal_id=terminal_id,
+        license_plate_color=license_plate_color,
+        license_plate=license_plate,
+    )
+
+
+# ==========================
+# 0x0102 Terminal Auth Body Parsing
+# ==========================
+
+def parse_0102_auth(body: bytes) -> JT808Auth:
+    """
+    Parse the 0x0102 (Terminal Authentication) message body.
+    The body is a variable-length ASCII authentication code string.
+    """
+    auth_code = body.decode("ascii", errors="replace")
+    return JT808Auth(auth_code=auth_code)
+
+
+# ==========================
+# 0x8001 Platform General Response Body Parsing
+# ==========================
+
+def parse_8001_platform_response(body: bytes) -> JT808PlatformResponse:
+    """
+    Parse the 0x8001 (Platform General Response) message body.
+    Layout:
+      0-1  response_flow_id (WORD) - flow ID of the terminal message being acknowledged
+      2-3  response_msg_id (WORD)  - message ID of the terminal message being acknowledged
+      4    result (BYTE)           - 0=success, 1=failure, 2=wrong message, 3=unsupported
+    """
+    if len(body) < 5:
+        raise ValueError("0x8001 body too short")
+
+    response_flow_id = int.from_bytes(body[0:2], "big")
+    response_msg_id = int.from_bytes(body[2:4], "big")
+    result = body[4]
+
+    return JT808PlatformResponse(
+        response_flow_id=response_flow_id,
+        response_msg_id=response_msg_id,
+        result=result,
+    )
+
+
+# ==========================
 # Frame Parsing
 # ==========================
 
@@ -365,11 +535,15 @@ def parse_jt808_frame(frame: bytes) -> JT808Packet:
     # Detailed body parsing for selected message IDs
     if header.msg_id == MSG_LOCATION_REPORT:
         pkt.location = parse_0200_location(body)
+    elif header.msg_id == MSG_TERMINAL_REGISTER:
+        pkt.register = parse_0100_register(body)
+    elif header.msg_id == MSG_TERMINAL_AUTH:
+        pkt.auth = parse_0102_auth(body)
+    elif header.msg_id == MSG_PLATFORM_RESPONSE:
+        pkt.platform_response = parse_8001_platform_response(body)
+    # MSG_HEARTBEAT (0x0002) has no body; pkt fields remain None.
 
-    # For other msg_ids (0x0100, 0x0102, 0x0002, etc.) you can add functions like:
-    #   parse_0100_register(body)
-    #   parse_0102_auth(body)
-    # and set them in the packet here.
+    # For additional message IDs, add parsers here.
 
     return pkt
 
@@ -460,39 +634,52 @@ def build_jt808_frame(
 # ==========================
 
 if __name__ == "__main__":
-    # Example hex frame (you must replace with a real JT808 0x0200 frame from your device).
-    # It MUST start and end with 0x7E.
-    example_hex = """
-    7E 02 00 ... 7E
-    """
-    # Replace "..." with real data.
+    # Build a sample 0x0200 location report frame and parse it back.
+    # Phone: 013800001234, Flow ID: 1
+    # Location: lat=39.774000, lon=116.352000, alt=50m, speed=60.0 km/h, dir=90
+    # Time: 2024-01-15 12:30:00 (BCD: 24 01 15 12 30 00)
+    import struct
 
-    # Quick guard for placeholder
-    if "..." in example_hex:
-        print("Please replace example_hex with a real JT808 frame.")
+    alarm = 0
+    status = 0b00000000_00000000_00000000_00000011  # ACC on + positioned
+    lat_raw = int(39.774 * 1_000_000)   # 39774000
+    lon_raw = int(116.352 * 1_000_000)  # 116352000
+    altitude = 50
+    speed_raw = 600   # 60.0 km/h
+    direction = 90
+    time_bcd = bytes([0x24, 0x01, 0x15, 0x12, 0x30, 0x00])  # 24/01/15 12:30:00
+
+    body = struct.pack(">IIIIHHH", alarm, status, lat_raw, lon_raw, altitude, speed_raw, direction)
+    body += time_bcd
+
+    frame = build_jt808_frame(
+        msg_id=MSG_LOCATION_REPORT,
+        body=body,
+        phone="013800001234",
+        flow_id=1,
+    )
+
+    print("Raw Frame:", bytes_to_hex(frame))
+
+    pkt = parse_jt808_frame(frame)
+
+    print("Message ID:", f"0x{pkt.msg_id:04X}")
+    print("Phone:", pkt.header.phone)
+    print("Flow ID:", pkt.header.flow_id)
+    print("Has subpackage:", pkt.header.has_subpackage)
+    print("Body length:", pkt.header.body_len)
+
+    if pkt.location:
+        loc = pkt.location
+        print("Location:")
+        print("  Alarm:", loc.alarm, decode_alarm_bits(loc.alarm))
+        print("  Status:", bin(loc.status), decode_status_bits(loc.status))
+        print("  Latitude:", loc.latitude)
+        print("  Longitude:", loc.longitude)
+        print("  Altitude (m):", loc.altitude)
+        print("  Speed (km/h):", loc.speed)
+        print("  Direction:", loc.direction)
+        print("  Time (YYMMDDhhmmss):", loc.time)
+        print("  Extra items:", loc.extra)
     else:
-        frame_bytes = hexstr_to_bytes(example_hex)
-        print("Raw Frame:", bytes_to_hex(frame_bytes))
-
-        pkt = parse_jt808_frame(frame_bytes)
-
-        print("Message ID:", f"0x{pkt.msg_id:04X}")
-        print("Phone:", pkt.header.phone)
-        print("Flow ID:", pkt.header.flow_id)
-        print("Has subpackage:", pkt.header.has_subpackage)
-        print("Body length:", pkt.header.body_len)
-
-        if pkt.location:
-            loc = pkt.location
-            print("Location:")
-            print("  Alarm:", loc.alarm)
-            print("  Status:", loc.status)
-            print("  Latitude:", loc.latitude)
-            print("  Longitude:", loc.longitude)
-            print("  Altitude (m):", loc.altitude)
-            print("  Speed (km/h):", loc.speed)
-            print("  Direction:", loc.direction)
-            print("  Time (YYMMDDhhmmss):", loc.time)
-            print("  Extra items:", loc.extra)
-        else:
-            print("No location parsed (message id is not 0x0200).")
+        print("No location parsed (message id is not 0x0200).")
