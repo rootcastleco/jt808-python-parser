@@ -1,4 +1,4 @@
-# JT808 Python Parser
+# jt808-python-parser
 
 A lightweight, pure-Python implementation of the **JT/T 808** (JT808) vehicle tracking protocol parser and frame builder, maintained by [rootcastle](https://github.com/rootcastleco).
 
